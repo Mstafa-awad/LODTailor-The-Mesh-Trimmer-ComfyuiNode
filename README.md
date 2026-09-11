@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/32102195/README.md)
 # LODTailor — The Mesh Trimmer
 
 High-performance, headless Blender mesh decimation and LOD (Level of Detail) optimization custom node for **ComfyUI**. Built specifically to handle ultra-dense AI-generated 3D meshes rapidly without stalling system memory or UI execution.
