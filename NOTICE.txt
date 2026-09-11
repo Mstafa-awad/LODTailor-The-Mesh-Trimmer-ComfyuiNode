@@ -1,0 +1,8 @@
+LODTailor — The Mesh Trimmer
+
+Project license: GNU General Public License v3 or later.
+
+Third-party attribution:
+The Blender high-to-low implementation is adapted in part from hp_to_lp_bake.py by Martin Johnson, from mdj128/aeon-unity-tools, under the MIT License.
+
+The upstream MIT license text is included in licenses/AEON-UNITY-TOOLS-MIT.txt.
