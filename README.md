@@ -4,7 +4,7 @@ High-performance, headless Blender mesh decimation and LOD (Level of Detail) opt
 
 ---
 
-# 🚀 SUPPORT MOSTAADTECH
+## 🚀 SUPPORT MOSTAADTECH
 
 ### ❤️ Enjoying this project / workflow?
 
