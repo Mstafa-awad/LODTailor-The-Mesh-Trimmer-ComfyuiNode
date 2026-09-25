@@ -10,15 +10,12 @@ It is designed for **large AI-generated 3D meshes** where you need fast face-cou
 
 ### Sword
 
-<video src="Doc/sword.mp4" controls width="100%"></video>
-
-[▶ Open sword demo](Doc/sword.mp4)
+![Sword Demo](Doc/sword.gif)
 
 ### Weapon
 
-<video src="Doc/weapong.mp4" controls width="100%"></video>
+![Weapon Demo](Doc/weapong.gif)
 
-[▶ Open weapon demo](Doc/weapong.mp4)
 
 ---
 
