@@ -14,7 +14,7 @@ It is designed for **large AI-generated 3D meshes** where you need fast face-cou
 
 ### Weapon
 
-![Weapon Demo](Doc/weapong.gif)
+![Weapon Demo](Doc/weapon.gif)
 
 
 ---
