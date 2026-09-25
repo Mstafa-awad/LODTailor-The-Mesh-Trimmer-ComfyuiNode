@@ -6,20 +6,22 @@ It is designed for **large AI-generated 3D meshes** where you need fast face-cou
 
 ---
 
-## Demo
-
-### Sword
-
-<video src="Doc/sword.mp4" controls width="100%"></video>
-
-[▶ Open sword demo](Doc/sword.mp4)
-
-### Weapon
-
-<video src="Doc/weapong.mp4" controls width="100%"></video>
-
-[▶ Open weapon demo](Doc/weapong.mp4)
-
+<table>
+  <tr>
+    <td align="center">
+      <strong>Sword Decimation</strong><br>
+      <a href="https://github.com/Mstafa-awad/LODTailor-The-Mesh-Trimmer-ComfyuiNode/blob/main/Doc/sword.mp4">
+        <video src="https://github.com/Mstafa-awad/LODTailor-The-Mesh-Trimmer-ComfyuiNode/raw/main/Doc/sword.mp4" width="100%" controls></video>
+      </a>
+    </td>
+    <td align="center">
+      <strong>Weapon Decimation</strong><br>
+      <a href="https://github.com/Mstafa-awad/LODTailor-The-Mesh-Trimmer-ComfyuiNode/blob/main/Doc/weapong.mp4">
+        <video src="https://github.com/Mstafa-awad/LODTailor-The-Mesh-Trimmer-ComfyuiNode/raw/main/Doc/weapong.mp4" width="100%" controls></video>
+      </a>
+    </td>
+  </tr>
+</table>
 ---
 
 ## What it does
