@@ -1,12 +1,10 @@
 import copy
 import importlib
 import inspect
-import os
 import shutil
 import subprocess
 import tempfile
 import types
-import uuid
 from pathlib import Path
 
 import numpy as np
@@ -107,6 +105,7 @@ def _squeeze_batch_array(value):
 
 def _resolve_input_path(raw_input):
     raw_input = (raw_input or "").strip()
+
     if not raw_input:
         return None
 
@@ -162,6 +161,7 @@ def _estimate_vertex_count(vertices):
             return int(len(vertices) // 3)
 
         first = vertices[0]
+
         if hasattr(first, "__len__") and not isinstance(first, (str, bytes)):
             return len(vertices)
 
@@ -191,7 +191,6 @@ def _iter_vertices(vertices):
             flat = list(vertices)
             for i in range(0, len(flat) - 2, 3):
                 yield flat[i:i + 3]
-
     except Exception:
         return
 
@@ -217,7 +216,6 @@ def _iter_faces(faces):
             flat = list(faces)
             for i in range(0, len(flat) - 2, 3):
                 yield flat[i:i + 3]
-
     except Exception:
         return
 
@@ -301,7 +299,7 @@ def _write_obj_from_arrays(vertices, faces, output_path):
     with open(output_path, "w", encoding="utf-8") as obj_file:
         for vertex in _iter_vertices(vertices):
             try:
-                x, y, z = [float(vertex[0]), float(vertex[1]), float(vertex[2])]
+                x, y, z = float(vertex[0]), float(vertex[1]), float(vertex[2])
                 obj_file.write(f"v {x} {y} {z}\n")
             except Exception:
                 continue
@@ -364,10 +362,12 @@ def _mesh_to_temp_path(mesh_data, temp_dir, seen=None):
                 possible_faces,
                 temp_dir,
             )
+
             if trimesh_path is not None:
                 return trimesh_path
 
             obj_path = temp_dir / "mesh_input.obj"
+
             try:
                 _write_obj_from_arrays(possible_vertices, possible_faces, obj_path)
                 if obj_path.exists() and obj_path.stat().st_size > 0:
@@ -430,6 +430,7 @@ def _mesh_to_temp_path(mesh_data, temp_dir, seen=None):
             uvs=uvs,
             colors=colors,
         )
+
         if trimesh_path is not None:
             return trimesh_path
 
@@ -470,14 +471,28 @@ def _load_processed_arrays(processed_path):
 
     loaded = trimesh.load(str(processed_path), force="mesh")
 
+    # Undo glTF vertex splits (position-only weld, like manual Merge by Distance).
+    try:
+        loaded.merge_vertices(merge_tex=True, merge_norm=True)
+    except Exception:
+        pass
+
+    try:
+        print(
+            f"[LODsmith] OUTPUT CHECK watertight={loaded.is_watertight} "
+            f"winding_consistent={loaded.is_winding_consistent} "
+            f"bodies={loaded.body_count} euler={loaded.euler_number}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
     vertices = np.asarray(loaded.vertices, dtype=np.float32)
     faces = np.asarray(loaded.faces, dtype=np.int64)
 
+    # IMPORTANT: do NOT bake trimesh's smooth vertex normals into the output.
+    # Smooth normals here are what made the model look shade-smooth everywhere.
     normals = None
-    try:
-        normals = np.asarray(loaded.vertex_normals, dtype=np.float32)
-    except Exception:
-        pass
 
     uvs = None
     try:
@@ -558,7 +573,7 @@ def _public_attrs(obj):
         return attrs
 
     if hasattr(obj, "__dict__"):
-        for key, value in obj.__dict__.items():
+        for key, value in vars(obj).items():
             if not key.startswith("_"):
                 attrs[key] = value
 
@@ -671,6 +686,8 @@ def _convert_geometry_array(arr, original_attr, kind):
                 want_batch = False
             else:
                 want_batch = True
+        else:
+            want_batch = True
 
     if want_batch:
         if arr.ndim == 2:
@@ -687,7 +704,6 @@ def _convert_geometry_array(arr, original_attr, kind):
         ):
             try:
                 import torch
-
                 tensor = torch.from_numpy(np.ascontiguousarray(arr))
                 return tensor.to(dtype=original_attr.dtype, device=original_attr.device)
             except Exception:
@@ -698,7 +714,6 @@ def _convert_geometry_array(arr, original_attr, kind):
 
     try:
         import torch
-
         return torch.from_numpy(np.ascontiguousarray(arr))
     except Exception:
         return arr
@@ -709,6 +724,7 @@ def _prepare_color_array(colors, vertex_count, template_color_attr):
 
     if template_color_attr is not None:
         shape = getattr(template_color_attr, "shape", None)
+
         if shape is not None and len(shape) > 0:
             if shape[-1] in (3, 4):
                 desired_channels = int(shape[-1])
@@ -763,11 +779,11 @@ def _make_output_mesh(original_mesh, processed_path):
         "faces": _convert_geometry_array(faces, template_faces, "faces"),
         "vertex_colors": _convert_geometry_array(colors, template_colors, "colors"),
         "uvs": _convert_geometry_array(uvs, template_uvs, "uvs") if uvs is not None else None,
-        "normals": _convert_geometry_array(normals, template_normals, "normals") if normals is not None else None,
+        "normals": None,
     }
 
     if template is not None and hasattr(template, "vertex_normals"):
-        updates["vertex_normals"] = updates["normals"]
+        updates["vertex_normals"] = None
 
     if template is not None and hasattr(template, "vertex_uvs"):
         updates["vertex_uvs"] = updates["uvs"]
@@ -797,12 +813,14 @@ def _make_output_mesh(original_mesh, processed_path):
         base_attrs.update(updates)
 
         constructed = _try_construct_official_mesh(base_attrs)
+
         if constructed is not None:
             return constructed
 
         return types.SimpleNamespace(**base_attrs)
 
     constructed = _try_construct_official_mesh(updates)
+
     if constructed is not None:
         return constructed
 
@@ -815,130 +833,86 @@ class LODTailorTheMeshTrimmer:
         return {
             "required": {
                 "mesh": ("MESH",),
-
                 "blender_path": ("STRING", {
                     "default": "blender",
                 }),
-
                 "target_tris": ("INT", {
-                    "default": 100,
+                    "default": 60000,
                     "min": 1,
                     "max": 10_000_000,
                     "step": 1,
                 }),
-
                 "passes": ("INT", {
                     "default": 3,
                     "min": 1,
                     "max": 1000,
                     "step": 1,
                 }),
-
                 "tolerance": ("FLOAT", {
                     "default": 1.05,
                     "min": 1.0,
                     "max": 2.0,
                     "step": 0.001,
                 }),
-
                 "intermediate_ratio": ("FLOAT", {
                     "default": 0.50,
                     "min": 0.001,
                     "max": 1.0,
                     "step": 0.001,
                 }),
-
                 "last_ratio": ("FLOAT", {
-                    "default": 0.10,
+                    "default": 0.25,
                     "min": 0.001,
                     "max": 1.0,
                     "step": 0.001,
                 }),
-
                 "final_ratio": ("FLOAT", {
-                    "default": 0.05,
+                    "default": 0.20,
                     "min": 0.001,
                     "max": 1.0,
                     "step": 0.001,
                 }),
-
                 "triangulate": ("BOOLEAN", {
                     "default": True,
                 }),
-
                 "symmetry": ("BOOLEAN", {
                     "default": False,
                 }),
-
-                "apply_transforms": ("BOOLEAN", {
-                    "default": True,
-                }),
-
-                "join_meshes": ("BOOLEAN", {
-                    "default": True,
-                }),
-
                 "voxel_rebuild": ("BOOLEAN", {
                     "default": True,
                 }),
-
                 "relative_voxel_size": ("FLOAT", {
                     "default": 0.0015,
                     "min": 0.00001,
                     "max": 0.1,
                     "step": 0.00001,
                 }),
-
                 "minimum_voxel_size": ("FLOAT", {
                     "default": 0.000001,
                     "min": 0.000001,
                     "max": 1.0,
                     "step": 0.000001,
                 }),
-
-                "cleanup_shells": ("BOOLEAN", {
-                    "default": True,
+                "seal_distance": ("FLOAT", {
+                    "default": 0.0001,
+                    "min": 0.000001,
+                    "max": 0.1,
+                    "step": 0.000001,
                 }),
-
-                "min_shell_faces": ("INT", {
-                    "default": 500,
+                "seal_max_steps": ("INT", {
+                    "default": 100,
                     "min": 1,
-                    "max": 100000,
+                    "max": 1000,
                     "step": 1,
                 }),
-
-                "repair": ("BOOLEAN", {
+                "seal_keep_trying": ("BOOLEAN", {
                     "default": True,
                 }),
-
-                "merge_by_distance": ("BOOLEAN", {
-                    "default": True,
-                }),
-
-                "merge_distance": ("FLOAT", {
-                    "default": 0.0001,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.00001,
-                }),
-
-                "remove_loose": ("BOOLEAN", {
-                    "default": True,
-                }),
-
-                "limited_dissolve": ("BOOLEAN", {
-                    "default": False,
-                }),
-
-                "dissolve_angle": ("FLOAT", {
-                    "default": 5.0,
-                    "min": 0.0,
-                    "max": 180.0,
-                    "step": 0.1,
-                }),
-
-                "recalc_normals": ("BOOLEAN", {
-                    "default": False,
+                "timeout_seconds": ("INT", {
+                    "default": 1800,
+                    "min": 0,
+                    "max": 86400,
+                    "step": 1,
                 }),
             }
         }
@@ -961,20 +935,13 @@ class LODTailorTheMeshTrimmer:
         final_ratio,
         triangulate,
         symmetry,
-        apply_transforms,
-        join_meshes,
         voxel_rebuild,
         relative_voxel_size,
         minimum_voxel_size,
-        cleanup_shells,
-        min_shell_faces,
-        repair,
-        merge_by_distance,
-        merge_distance,
-        remove_loose,
-        limited_dissolve,
-        dissolve_angle,
-        recalc_normals,
+        seal_distance,
+        seal_max_steps,
+        seal_keep_trying,
+        timeout_seconds,
     ):
         temp_dir = Path(tempfile.mkdtemp(prefix="lodsmith_decimator_"))
 
@@ -999,9 +966,8 @@ class LODTailorTheMeshTrimmer:
                 "--final-ratio", str(float(final_ratio)),
                 "--relative-voxel-size", str(float(relative_voxel_size)),
                 "--minimum-voxel-size", str(float(minimum_voxel_size)),
-                "--min-shell-faces", str(int(min_shell_faces)),
-                "--merge-distance", str(float(merge_distance)),
-                "--dissolve-angle", str(float(dissolve_angle)),
+                "--seal-distance", str(float(seal_distance)),
+                "--seal-max-steps", str(int(seal_max_steps)),
             ]
 
             if triangulate:
@@ -1010,32 +976,11 @@ class LODTailorTheMeshTrimmer:
             if symmetry:
                 cli_args.append("--symmetry")
 
-            if apply_transforms:
-                cli_args.append("--apply-transforms")
-
-            if join_meshes:
-                cli_args.append("--join-meshes")
-
             if voxel_rebuild:
                 cli_args.append("--voxel")
 
-            if cleanup_shells:
-                cli_args.append("--cleanup-shells")
-
-            if repair:
-                cli_args.append("--repair")
-
-            if merge_by_distance:
-                cli_args.append("--merge-by-distance")
-
-            if remove_loose:
-                cli_args.append("--remove-loose")
-
-            if limited_dissolve:
-                cli_args.append("--limited-dissolve")
-
-            if recalc_normals:
-                cli_args.append("--recalc-normals")
+            if seal_keep_trying:
+                cli_args.append("--seal-keep-trying")
 
             blender_executable = (blender_path or "").strip() or "blender"
 
@@ -1049,14 +994,21 @@ class LODTailorTheMeshTrimmer:
 
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=creation_flags,
-            )
+            try:
+                process = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=creation_flags,
+                    timeout=(int(timeout_seconds) if int(timeout_seconds) > 0 else None),
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    f"Blender decimation timed out after {int(timeout_seconds)}s "
+                    "(raise timeout_seconds or lower target detail)."
+                )
 
             if process.returncode != 0 or not processed_path.exists():
                 print("[LODsmith Decimator] Blender failed.")
@@ -1067,6 +1019,7 @@ class LODTailorTheMeshTrimmer:
                 )
 
             output_mesh = _make_output_mesh(mesh, processed_path)
+
             return (output_mesh,)
 
         finally:

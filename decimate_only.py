@@ -1,7 +1,9 @@
-# decimate_only.py
-# ULTRA-FAST MODIFIER PIPELINE (v2 — all node options now functional)
-# Object-mode modifiers for heavy work; numpy rebuilds for topology cleanup;
-# one small edit-mode session (on the REDUCED mesh) for repair/normals.
+"""
+ULTRA-FAST DECIMATION PIPELINE (v5.2)
+- NO smoothing anywhere (flat shading forced, flat normals exported).
+- FINAL step = Blender "Merge by Distance" with CENTROID MERGE (same as UI),
+  applied at the END, increasing by the user's base distance until watertight.
+"""
 import argparse
 import math
 import sys
@@ -26,171 +28,78 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--tris", type=int, default=100)
-    p.add_argument("--merge-distance", type=float, default=0.0001)
-    p.add_argument("--dissolve-angle", type=float, default=5.0)
-    p.add_argument("--symmetry", action="store_true")
-    p.add_argument("--apply-transforms", action="store_true")
-    p.add_argument("--join-meshes", action="store_true")
-    p.add_argument("--voxel", action="store_true")
-    p.add_argument("--relative-voxel-size", type=float, default=0.0015)
+    p.add_argument("--tris", type=int, default=60000)
     p.add_argument("--passes", type=int, default=3)
     p.add_argument("--tolerance", type=float, default=1.05)
     p.add_argument("--intermediate-ratio", type=float, default=0.5)
-    p.add_argument("--last-ratio", type=float, default=0.1)
-    p.add_argument("--final-ratio", type=float, default=0.05)
+    p.add_argument("--last-ratio", type=float, default=0.25)
+    p.add_argument("--final-ratio", type=float, default=0.2)
     p.add_argument("--triangulate", action="store_true")
+    p.add_argument("--symmetry", action="store_true")
+    p.add_argument("--voxel", action="store_true")
+    p.add_argument("--relative-voxel-size", type=float, default=0.0015)
     p.add_argument("--minimum-voxel-size", type=float, default=0.000001)
-    p.add_argument("--cleanup-shells", action="store_true")
-    p.add_argument("--min-shell-faces", type=int, default=500)
-    p.add_argument("--repair", action="store_true")
-    p.add_argument("--merge-by-distance", action="store_true")
-    p.add_argument("--remove-loose", action="store_true")
-    p.add_argument("--limited-dissolve", action="store_true")
-    p.add_argument("--recalc-normals", action="store_true")
+    p.add_argument("--seal-distance", type=float, default=0.0001)
+    p.add_argument("--seal-max-steps", type=int, default=100)
+    p.add_argument("--seal-keep-trying", action="store_true")
     return p.parse_args(get_args())
 
 
-# ---------------------------------------------------------------- numpy helpers
-_FIELD_BY_TYPE = {
-    'FLOAT': ("value", 1, np.float32),
-    'INT': ("value", 1, np.int32),
-    'INT8': ("value", 1, np.int8),
-    'BOOLEAN': ("value", 1, np.bool_),
-    'FLOAT_VECTOR': ("vector", 3, np.float32),
-    'FLOAT_COLOR': ("color", 4, np.float32),
-    'BYTE_COLOR': ("color", 4, np.float32),
-}
-
-
+# ------------------------------------------------------------------ analysis
 def _read_mesh_arrays(obj):
     me = obj.data
     nv, nf, nl = len(me.vertices), len(me.polygons), len(me.loops)
+
     co = np.empty(nv * 3, dtype=np.float32)
     me.vertices.foreach_get("co", co)
+
     loop_vert = np.empty(nl, dtype=np.int64)
     me.loops.foreach_get("vertex_index", loop_vert)
+
     loop_start = np.empty(nf, dtype=np.int64)
     me.polygons.foreach_get("loop_start", loop_start)
+
     loop_total = np.empty(nf, dtype=np.int64)
     me.polygons.foreach_get("loop_total", loop_total)
+
     return me, co.reshape(nv, 3), loop_vert, loop_start, loop_total
 
 
-def _rebuild_mesh(obj, keep_vert, keep_face):
-    """Fast C-level rebuild keeping only kept verts/faces, preserving
-    materials and POINT/CORNER attributes (UVs, vertex colors)."""
+def _edge_stats(obj):
+    """Return (boundary_edges, non_manifold_edges). Watertight == (0, 0)."""
     me, co, loop_vert, loop_start, loop_total = _read_mesh_arrays(obj)
-    nv, nf = len(co), len(keep_face)
-    loop_mask = np.repeat(keep_face, loop_total)
-    kept_loops = np.nonzero(loop_mask)[0]
-    remap = np.cumsum(keep_vert) - 1
-    new_loop_vert = remap[loop_vert[kept_loops]]
-    new_loop_total = loop_total[keep_face]
-    new_loop_start = np.concatenate(([0], np.cumsum(new_loop_total)[:-1]))
-    new_co = co[keep_vert]
 
-    new_me = bpy.data.meshes.new(obj.data.name + "_clean")
-    new_me.vertices.add(int(keep_vert.sum()))
-    new_me.vertices.foreach_set("co", new_co.ravel())
-    new_me.loops.add(len(new_loop_vert))
-    new_me.loops.foreach_set("vertex_index", new_loop_vert)
-    new_me.polygons.add(int(keep_face.sum()))
-    new_me.polygons.foreach_set("loop_start", new_loop_start)
-    new_me.polygons.foreach_set("loop_total", new_loop_total)
-    for mat in me.materials:
-        new_me.materials.append(mat)
-    # copy attributes
-    kept_vert_idx = np.nonzero(keep_vert)[0]
-    for attr in me.attributes:
-        spec = _FIELD_BY_TYPE.get(attr.data_type)
-        if spec is None or attr.domain not in ('POINT', 'CORNER'):
-            continue
-        field, comps, dt = spec
-        try:
-            src = np.empty(len(attr.data) * comps, dtype=dt)
-            attr.data.foreach_get(field, src)
-            src = src.reshape(-1, comps)
-            pick = kept_vert_idx if attr.domain == 'POINT' else kept_loops
-            dst_attr = new_me.attributes.new(attr.name, attr.data_type, attr.domain)
-            dst_attr.data.foreach_set(field, src[pick].ravel())
-        except Exception:
-            continue
-    new_me.update()
-    old = obj.data
-    obj.data = new_me
-    bpy.data.meshes.remove(old)
-    return len(new_me.polygons)
-
-
-def _remove_loose(obj):
-    me, co, loop_vert, loop_start, loop_total = _read_mesh_arrays(obj)
-    used = np.zeros(len(co), dtype=bool)
-    used[np.unique(loop_vert)] = True
-    if used.all():
-        return 0, 0
-    removed = int((~used).sum())
-    nf = _rebuild_mesh(obj, used, np.ones(len(loop_total), dtype=bool))
-    return removed, nf
-
-
-def _component_face_labels(loop_vert, loop_start, loop_total, nv):
+    nv = len(co)
     idx = np.arange(len(loop_vert))
+
     face_id = np.repeat(np.arange(len(loop_start)), loop_total)
     local = idx - loop_start[face_id]
     nxt = loop_start[face_id] + ((local + 1) % loop_total[face_id])
+
     a, b = loop_vert[idx], loop_vert[nxt]
+
     keep = a != b
-    lo, hi = np.minimum(a, b)[keep], np.maximum(a, b)[keep]
-    parent = np.arange(nv)
-    for _ in range(128):
-        ra, rb = parent[lo], parent[hi]
-        np.minimum.at(parent, np.maximum(ra, rb), np.minimum(ra, rb))
-        parent = parent[parent]
-        if np.array_equal(parent[parent], parent) and np.array_equal(parent[lo], parent[hi]):
-            break
-    return parent[loop_vert[loop_start]]
+    lo = np.minimum(a, b)[keep]
+    hi = np.maximum(a, b)[keep]
+
+    keys = lo * np.int64(nv) + hi
+    _, counts = np.unique(keys, return_counts=True)
+
+    boundary = int(np.count_nonzero(counts == 1))
+    nonmanifold = int(np.count_nonzero(counts > 2))
+
+    return boundary, nonmanifold
 
 
-def _cleanup_shells(obj, min_faces):
-    me, co, loop_vert, loop_start, loop_total = _read_mesh_arrays(obj)
-    labels = _component_face_labels(loop_vert, loop_start, loop_total, len(co))
-    counts = np.bincount(labels, minlength=len(co))
-    face_keep = counts[labels] >= int(min_faces)
-    n_shells = len(np.unique(labels))
-    n_kept_shells = len(np.unique(labels[face_keep])) if face_keep.any() else 0
-    if face_keep.all():
-        return 0, len(loop_total)
-    if not face_keep.any():  # never delete everything: keep largest shell
-        vals, cnts = np.unique(labels, return_counts=True)
-        face_keep = labels == vals[cnts.argmax()]
-        n_kept_shells = 1
-    used = np.zeros(len(co), dtype=bool)
-    loop_mask = np.repeat(face_keep, loop_total)
-    used[np.unique(loop_vert[loop_mask])] = True
-    nf = _rebuild_mesh(obj, used, face_keep)
-    log(f" -> Shells: {n_shells} -> {n_kept_shells} (min_faces={min_faces})")
-    return n_shells - n_kept_shells, nf
-
-
-def _edit_cleanup(obj, do_repair, do_recalc, degenerate_threshold):
+# ------------------------------------------------------------------ editing
+def _set_active(obj):
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.select_all(action='DESELECT')
     obj.select_set(True)
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='SELECT')
-    if do_repair:
-        bpy.ops.mesh.dissolve_degenerate(threshold=degenerate_threshold)
-        bpy.ops.mesh.fill_holes(sides=0)
-    if do_recalc:
-        bpy.ops.mesh.normals_make_consistent(inside=False)
-    bpy.ops.object.mode_set(mode='OBJECT')
 
 
 def _apply_modifier(obj, mod, tag):
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
+    _set_active(obj)
     bpy.ops.object.modifier_apply(modifier=mod.name)
     return len(obj.data.polygons)
 
@@ -198,138 +107,274 @@ def _apply_modifier(obj, mod, tag):
 def _weld(obj, distance, tag):
     mod = obj.modifiers.new("Weld", 'WELD')
     mod.merge_threshold = float(distance)
-    tris = _apply_modifier(obj, mod, tag)
-    log(f" -> Weld({tag}): {tris:,} faces")
-    return tris
+    return _apply_modifier(obj, mod, tag)
 
 
 def _collapse(obj, ratio, symmetry, tag):
     mod = obj.modifiers.new(tag, 'DECIMATE')
     mod.decimate_type = 'COLLAPSE'
     mod.ratio = float(ratio)
+
     if symmetry:
         mod.use_symmetry = True
+
     tris = _apply_modifier(obj, mod, tag)
     log(f" -> {tag}: {tris:,} faces")
     return tris
 
 
+def _adaptive_seal(obj, start, max_steps, tag):
+    """Cheap input-side seal (old safe behavior: stops when no improvement)."""
+    dist = max(float(start), 1e-7)
+    step = dist
+
+    diag = math.sqrt(sum(d * d for d in obj.dimensions)) or 1.0
+    cap = diag * 0.005
+
+    b, nm = _edge_stats(obj)
+    log(f" -> Seal[{tag}] pre-weld: boundary={b:,} nonmanifold={nm:,}")
+
+    if b == 0 and nm == 0:
+        log(f" -> Seal[{tag}] already watertight+manifold")
+        return dist, True
+
+    sealed = False
+    i = 0
+
+    while i < int(max_steps) and dist <= cap:
+        prev_me = obj.data.copy()
+
+        _weld(obj, dist, f"seal-{tag}-{i + 1}")
+
+        b2, nm2 = _edge_stats(obj)
+        log(f" -> Seal[{tag}] step {i + 1}: distance={dist:.6f} "
+            f"boundary={b2:,} nonmanifold={nm2:,}")
+
+        if b2 == 0 and nm2 == 0:
+            bpy.data.meshes.remove(prev_me)
+            sealed = True
+            log(f" -> Seal[{tag}] SEALED at distance={dist:.6f}")
+            break
+
+        if (b2 + nm2) >= (b + nm):
+            bad = obj.data
+            obj.data = prev_me
+            bpy.data.meshes.remove(bad)
+            log(f" -> Seal[{tag}] no improvement, reverted step")
+            break
+
+        bpy.data.meshes.remove(prev_me)
+
+        b, nm = b2, nm2
+        dist += step
+        i += 1
+
+    if not sealed:
+        log(f" -> Seal[{tag}] WARNING: boundary={b:,} nonmanifold={nm:,} "
+            f"after {i} steps (cap={cap:.6f})")
+
+    return dist, sealed
+
+
+# ------------------------------------------- Merge by Distance + Centroid Merge
+def _centroid_merge_kwargs():
+    """
+    Detect the 'Centroid Merge' checkbox of bpy.ops.mesh.remove_doubles
+    at runtime (same option you ticked in the UI panel).
+    """
+    try:
+        rna = bpy.ops.mesh.remove_doubles.get_rna_type()
+        for prop in rna.properties:
+            label = (prop.name or "").lower()
+            ident = (prop.identifier or "").lower()
+            if "centroid" in label or "centroid" in ident:
+                return {prop.identifier: True}
+    except Exception:
+        pass
+    return {}
+
+
+def _merge_by_distance_centroid(obj, distance, tag):
+    """
+    EXACT equivalent of your UI operation:
+    Merge by Distance, Centroid Merge = ON, all verts selected.
+    """
+    _set_active(obj)
+    try:
+        if bpy.context.object is not None and bpy.context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+
+        kwargs = {"threshold": float(distance)}
+        kwargs.update(_centroid_merge_kwargs())
+
+        bpy.ops.mesh.remove_doubles(**kwargs)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        return len(obj.data.polygons)
+    except Exception as e:
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+        log(f" -> {tag}: remove_doubles failed ({e}), fallback Weld modifier")
+        mod = obj.modifiers.new("Weld", 'WELD')
+        mod.merge_threshold = float(distance)
+        return _apply_modifier(obj, mod, tag)
+
+
+def _final_watertight_merge(obj, base, max_steps, keep_trying, tag="output"):
+    """
+    Applied AT THE END.
+    0.0001 -> 0.0002 -> 0.0003 ... (base * step)
+    Stops only when boundary == 0 and nonmanifold == 0,
+    or when max_steps / safety cap is reached.
+    """
+    base = max(float(base), 1e-7)
+    max_steps = max(1, int(max_steps))
+
+    diag = math.sqrt(sum(d * d for d in obj.dimensions)) or 1.0
+    cap = max(diag * 0.005, base * float(max_steps)) if keep_trying else diag * 0.005
+
+    b, nm = _edge_stats(obj)
+    log(f" -> Merge[{tag}] pre: boundary={b:,} nonmanifold={nm:,} "
+        f"keep_trying={keep_trying}")
+
+    if b == 0 and nm == 0:
+        log(f" -> Merge[{tag}] already watertight")
+        return base, True
+
+    sealed = False
+    last = base
+    steps = max_steps if keep_trying else 1
+
+    for step_i in range(1, steps + 1):
+        dist = round(base * float(step_i), 12)
+
+        if dist > cap:
+            log(f" -> Merge[{tag}] safety cap reached ({cap:.6f})")
+            break
+
+        last = dist
+        _merge_by_distance_centroid(obj, dist, f"Merge[{tag}] step {step_i}")
+
+        b2, nm2 = _edge_stats(obj)
+        log(f" -> Merge[{tag}] step {step_i}: distance={dist:.6f} "
+            f"boundary={b2:,} nonmanifold={nm2:,}")
+
+        if b2 == 0 and nm2 == 0:
+            sealed = True
+            log(f" -> Merge[{tag}] WATERTIGHT at distance={dist:.6f}")
+            break
+
+    if not sealed:
+        b, nm = _edge_stats(obj)
+        log(f" -> Merge[{tag}] NOT watertight after loop: "
+            f"boundary={b:,} nonmanifold={nm:,}")
+
+    return last, sealed
+
+
+# ------------------------------------------------------------------ main
 def process():
     args = parse_args()
+
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
     ext = Path(args.input).suffix.lower()
+
     if ext in ['.glb', '.gltf']:
         bpy.ops.import_scene.gltf(filepath=args.input)
     elif ext == '.obj':
-        bpy.ops.wm.obj_import(filepath=args.input)
+        try:
+            bpy.ops.wm.obj_import(filepath=args.input)
+        except AttributeError:
+            bpy.ops.import_scene.obj(filepath=args.input)
     elif ext == '.ply':
-        if hasattr(bpy.ops.wm, "ply_import"):
-            bpy.ops.import_mesh.ply(filepath=args.input)
-        else:
-            bpy.ops.import_mesh.ply(filepath=args.input)
+        bpy.ops.import_mesh.ply(filepath=args.input)
+    else:
+        raise RuntimeError(f"Unsupported input type: {ext}")
+
     meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
     if not meshes:
         raise RuntimeError("No meshes found")
 
-    if args.apply_transforms:
-        for o in meshes:
-            bpy.context.view_layer.objects.active = o
-            bpy.ops.object.select_all(action='DESELECT')
-            o.select_set(True)
-            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    for o in meshes:
+        _set_active(o)
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-    if args.join_meshes and len(meshes) > 1:
+    if len(meshes) > 1:
         bpy.ops.object.select_all(action='SELECT')
         bpy.context.view_layer.objects.active = meshes[0]
         bpy.ops.object.join()
         meshes = [bpy.context.active_object]
 
-    do_weld = bool(args.merge_by_distance) and float(args.merge_distance) > 0.0
-
     for obj in meshes:
         t0 = time.time()
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
+
+        _set_active(obj)
         tris = len(obj.data.polygons)
         log(f"Start: {tris:,} faces")
 
-        # 1. MERGE BY DISTANCE on the INPUT (now respects the boolean, all branches)
-        if do_weld:
-            tris = _weld(obj, args.merge_distance, "input")
+        # 1. cheap input seal
+        _adaptive_seal(obj, args.seal_distance, args.seal_max_steps, "input")
 
-        # 2. LIMITED DISSOLVE (now gated by its own boolean)
-        if args.limited_dissolve and args.dissolve_angle > 0:
-            mod = obj.modifiers.new("Planar", 'DECIMATE')
-            mod.decimate_type = 'DISSOLVE'
-            mod.angle_limit = math.radians(args.dissolve_angle)
-            mod.use_dissolve_boundaries = True
-            tris = _apply_modifier(obj, mod, "Planar")
-            log(f" -> Planar: {tris:,} faces")
-
-        # 3. VOXEL REBUILD
+        # 2. voxel rebuild
         if args.voxel:
             dim = max(obj.dimensions) if max(obj.dimensions) > 0 else 1.0
             v_size = max(dim * args.relative_voxel_size, args.minimum_voxel_size)
+
             mod = obj.modifiers.new("Voxel", 'REMESH')
             mod.mode = 'VOXEL'
             mod.voxel_size = v_size
+
             tris = _apply_modifier(obj, mod, "Voxel")
             log(f" -> Voxel: {tris:,} faces")
 
-        # 4. TRIANGULATE early so every count below is real triangles
+        # 3. triangulate
         if args.triangulate:
             mod = obj.modifiers.new("Tri", 'TRIANGULATE')
             tris = _apply_modifier(obj, mod, "Tri")
             log(f" -> Triangulate: {tris:,} faces")
 
-        # 5. STAGED DECIMATION (passes / tolerance / ratio ladder now used)
+        # 4. staged decimation
         target = max(4, args.tris)
         tol = max(1.0, args.tolerance)
+        SAFE_FLOOR = 0.15
+
         if tris > target * tol:
-            if tris > 1_000_000:  # guard crush so huge inputs never lock
+            if tris > 1_000_000:
                 tris = _collapse(obj, max(200_000, target) / tris, args.symmetry, "Guard")
+
             for p in range(max(1, args.passes)):
                 if tris <= target * tol:
                     break
+
                 remaining = args.passes - p
+
                 if remaining >= 3:
                     floor = args.intermediate_ratio
                 elif remaining == 2:
                     floor = args.last_ratio
                 else:
                     floor = args.final_ratio
+
+                floor = max(floor, SAFE_FLOOR)
                 ratio = min(1.0, max(floor, target / tris))
+
                 if ratio >= 1.0:
                     break
+
                 tris = _collapse(obj, ratio, args.symmetry, f"Pass{p + 1}")
-            if tris > target * tol and tris > target:
-                tris = _collapse(obj, target / tris, args.symmetry, "Final")
 
-        # 6. MERGE BY DISTANCE on the OUTPUT (the step that was missing)
-        if do_weld:
-            tris = _weld(obj, args.merge_distance, "output")
+            guard = 0
+            while tris > target * tol and tris > target and guard < 6:
+                tris = _collapse(obj, max(0.25, target / tris), args.symmetry, f"Final{guard + 1}")
+                guard += 1
 
-        # 7. CLEANUP SHELLS (drop floater components below min_shell_faces)
-        if args.cleanup_shells:
-            _, tris = _cleanup_shells(obj, args.min_shell_faces)
-            log(f" -> After shell cleanup: {tris:,} faces")
-
-        # 8. REMOVE LOOSE verts/edges
-        if args.remove_loose:
-            removed, tris = _remove_loose(obj)
-            if removed:
-                log(f" -> Loose removed: {removed:,} verts | {tris:,} faces")
-
-        # 9. REPAIR + RECALC NORMALS (one edit-mode session, on the small mesh)
-        if args.repair or args.recalc_normals:
-            thr = args.merge_distance if args.merge_distance > 0 else 1e-5
-            _edit_cleanup(obj, bool(args.repair), bool(args.recalc_normals), thr)
-            tris = len(obj.data.polygons)
-            log(f" -> Repair/Normals: {tris:,} faces")
-
-        # 10. safety triangulate in case repair created ngons
+        # 5. safety triangulate (merge can leave ngons)
         if args.triangulate:
             me = obj.data
             if any(len(p.vertices) != 3 for p in me.polygons[:2000]):
@@ -337,18 +382,53 @@ def process():
                 tris = _apply_modifier(obj, mod, "Tri2")
                 log(f" -> Triangulate(final): {tris:,} faces")
 
+        # 6. FINAL: Merge by Distance (Centroid Merge) until watertight
+        _final_watertight_merge(
+            obj,
+            args.seal_distance,
+            args.seal_max_steps,
+            args.seal_keep_trying,
+            "output",
+        )
+
+        tris = len(obj.data.polygons)
+        b, nm = _edge_stats(obj)
+
+        log(f"FINAL: {tris:,} faces | boundary={b:,} nonmanifold={nm:,} "
+            f"| watertight={'YES' if (b == 0 and nm == 0) else 'NO'}")
         log(f"Finished in {time.time() - t0:.2f} seconds")
 
+    # 7. NO SMOOTHING. Force flat shading + kill custom split normals.
+    for obj in meshes:
+        try:
+            _set_active(obj)
+            bpy.ops.mesh.custom_splitnormals_clear()
+        except Exception:
+            pass
+
+        n = len(obj.data.polygons)
+        if n:
+            obj.data.polygons.foreach_set("use_smooth", np.zeros(n, dtype=bool))
+            obj.data.update()
+
+    # 8. export WITH normals so the flat shading survives the GLB round-trip.
     out_ext = Path(args.output).suffix.lower()
+
     bpy.ops.object.select_all(action='SELECT')
+
     if out_ext in ['.glb', '.gltf']:
         bpy.ops.export_scene.gltf(
             filepath=args.output, use_selection=True,
             export_format='GLB' if out_ext == '.glb' else 'GLTF_SEPARATE')
     elif out_ext == '.obj':
-        bpy.ops.wm.obj_export(filepath=args.output, export_selected_objects=True)
+        try:
+            bpy.ops.wm.obj_export(filepath=args.output, export_selected_objects=True)
+        except AttributeError:
+            bpy.ops.export_scene.obj(filepath=args.output, use_selection=True)
     elif out_ext == '.ply':
         bpy.ops.wm.ply_export(filepath=args.output, export_selected_objects=True)
+    else:
+        raise RuntimeError(f"Unsupported output type: {out_ext}")
 
 
 if __name__ == "__main__":
